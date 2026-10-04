@@ -50,6 +50,24 @@
   目标；范围外的失效引用不阻止摘录，也不影响整稿导出的既有规则。
 - 返回摘录文本及各条的稳定身份、草稿编号（当前显示编号）与摘录编号。
 
+逐条复核（``POST /api/review`` / ``POST /api/review/status`` / ``POST /api/review/export``）：
+- 复核只针对**已保存正文**：对某条建立复核记录时，记下其稳定身份与“当刻它自身和沿有效
+  引用（目标仍在草稿内）可达的全部现存条款”的内部正文；自引用 / 循环只计一次。纯重排、
+  编号平移不改变记录内容。
+- 记录是否仍然有效由服务端核对：现存身份仍在、自身内部正文未变，且记录中每份正文与其
+  可达条款集合都和当前草稿逐字一致才有效。任一条引用目标被删除（集合缩小）、自身或可达
+  条款正文被编辑 / 合并 / 拆分 / 复制改写（正文变化或集合变化）都会失效；**清除后即使把
+  正文改回旧文也不自动恢复**（是否有效只比对当前草稿，不保留历史版本）；与本条无关的
+  改动（不可达条款的正文变化、纯重排）不影响其有效性；拆分 / 复制产生的新条款默认未复核。
+- ``/api/review/status`` 入参为草稿（``draft``）与全部复核记录（``reviews``），核对后
+  返回按当前顺序排列的未复核项、仍有效记录与失效引用标记；结构损坏的记录 422 拒绝，
+  已失效 / 身份已不存在的记录直接不出现在有效列表中（由调用方清除，不报错）。
+- ``/api/review/export`` 入参相同：**全部现存条款均有有效记录且无失效引用**时，按整稿
+  导出（``/api/export``）同一格式返回复核稿文本；尚有未复核条款 409（附未复核项），
+  存在失效引用 409（附来源）。
+- 三个接口均只读：不改正文、顺序、基线、身份上界、引用绑定或存档；复核记录不进入存档
+  协议，只存在于调用方（页面内存），重新导入、成功恢复存档或刷新后由页面清空。
+
 校稿存档（``GET /api/archive`` / ``PUT /api/archive``）：
 - 服务端用 SQLite 保存**一个共享槽**的完整快照：不可变原稿基线、当前顺序、内部正文
   （``order_ids`` / ``clauses``，内部形态 ``[[c3]]``）与已用身份上界（``id_counter``）；
@@ -151,6 +169,28 @@ class ReferrersIn(StateIn):
 
 class ExcerptIn(StateIn):
     selected_ids: list[str]  # 要收入摘录的条款身份；自动并入其直接、间接引用的全部现存条款
+
+
+class ReviewRecordIn(BaseModel):
+    # 一条复核记录：稳定身份 + 复核当刻自身与全部可达（有效引用）条款的内部正文；
+    # 纯重排、编号平移不影响其内容（正文按内部绑定形态记录）
+    id: str
+    bodies: dict[str, str]
+
+
+class ReviewIn(StateIn):
+    review_id: str  # 本次要建立复核记录的条款稳定身份；不存在则 422 拒绝
+
+
+class ReviewStatusIn(BaseModel):
+    # 复核状态核对：当前草稿 + 调用方（页面内存）持有的全部复核记录；
+    # 服务端不持久化任何记录，也不改存档协议
+    draft: StateIn
+    reviews: list[ReviewRecordIn]
+
+
+class ReviewExportIn(ReviewStatusIn):
+    pass  # 入参与状态核对相同；全部现存条款已复核且无失效引用时返回复核稿文本
 
 
 class ArchiveSnapshotIn(BaseModel):
@@ -944,6 +984,198 @@ def excerpt_doc(payload: ExcerptIn):
             }
         )
     return {"text": "\n".join(lines), "items": items}
+
+
+# --------------------------------------------------------------------------- #
+# 逐条复核（只读：不改正文、顺序、基线、身份上界、引用绑定或存档）
+# --------------------------------------------------------------------------- #
+def _reachable(by_id: dict[str, ClauseIn], root_id: str) -> set[str]:
+    """从 root_id 沿有效引用（目标仍在草稿内）可达的全部现存条款，含其自身。
+
+    自引用、循环与重复引用只收录一次（与摘录闭包同一规则）。
+    """
+    included: set[str] = {root_id}
+    queue: deque[str] = deque([root_id])
+    while queue:
+        clause_id = queue.popleft()
+        for m in MARKER_RE.finditer(by_id[clause_id].body):
+            target = m.group(1)
+            if target in by_id and target not in included:
+                included.add(target)
+                queue.append(target)
+    return included
+
+
+def _build_review_record(by_id: dict[str, ClauseIn], root_id: str) -> ReviewRecordIn:
+    """建立复核记录：稳定身份与当刻自身及全部可达条款的内部正文。"""
+    reach = _reachable(by_id, root_id)
+    return ReviewRecordIn(id=root_id, bodies={cid: by_id[cid].body for cid in reach})
+
+
+def _validate_review_records(reviews: list[ReviewRecordIn]) -> None:
+    """复核记录的结构校验（与当前草稿无关的部分）。
+
+    身份须为合法稳定 id 且不重复；bodies 的键均为合法稳定 id，值为非空、单行、
+    引用形态完整（``[[cN]]``）的内部正文；被复核条款自身必须在 bodies 中。
+    已失效记录（身份已不在草稿、正文对不上）不在此列，由状态核对直接丢弃。
+    """
+    errors: list[str] = []
+    seen: set[str] = set()
+    for rec in reviews:
+        if not ID_RE.match(rec.id):
+            errors.append(f"复核记录身份非法：{rec.id}")
+            continue
+        if rec.id in seen:
+            errors.append(f"复核记录重复：{rec.id}")
+        seen.add(rec.id)
+        if rec.id not in rec.bodies:
+            errors.append(f"复核记录 {rec.id} 缺少被复核条款自身的正文")
+        for key, body in rec.bodies.items():
+            if not ID_RE.match(key):
+                errors.append(f"复核记录 {rec.id} 的引用条款身份非法：{key}")
+                continue
+            if body.strip() == "":
+                errors.append(f"复核记录 {rec.id} 中 {key} 的正文为空")
+            if "\n" in body:
+                errors.append(f"复核记录 {rec.id} 中 {key} 的正文不是单行")
+            for m in MARKER_RE.finditer(body):
+                if not ID_RE.match(m.group(1)):
+                    errors.append(
+                        f"复核记录 {rec.id} 中 {key} 的内部引用形态损坏：{m.group(0)}"
+                    )
+            if _stray_opens(body) or _stray_closes(body):
+                errors.append(f"复核记录 {rec.id} 中 {key} 的正文存在未闭合标记")
+    if errors:
+        raise HTTPException(422, detail={"errors": errors})
+
+
+def _valid_review_ids(
+    order_ids: list[str],
+    by_id: dict[str, ClauseIn],
+    reviews: list[ReviewRecordIn],
+) -> set[str]:
+    """按当前草稿核对，返回仍有效的复核记录身份集合（已失效 / 身份消失的记录丢弃）。
+
+    有效条件（全部满足）：
+    - 被复核身份仍是现存条款；
+    - 记录的正文键集合恰为其当前沿有效引用可达的条款集合（含自身；循环只计一次）；
+    - 记录中每份内部正文与当前草稿对应条款逐字一致。
+    纯重排 / 编号平移：集合与内部正文均不变，记录保持有效；
+    引用目标删除（集合缩小）、自身或可达条款正文被编辑 / 合并 / 拆分 / 复制改写
+    （正文变化或集合变化）都会失效；改回旧文不恢复——是否有效只比对当前草稿。
+    """
+    valid: set[str] = set()
+    for rec in reviews:
+        if rec.id not in by_id:
+            continue
+        reach = _reachable(by_id, rec.id)
+        if set(rec.bodies) != reach:
+            continue
+        if all(rec.bodies.get(cid) == by_id[cid].body for cid in reach):
+            valid.add(rec.id)
+    return valid
+
+
+def _review_status_payload(
+    state: StateIn, reviews: list[ReviewRecordIn]
+) -> tuple[list[dict], list[dict], bool]:
+    """核对复核记录，返回（未复核项列表，仍有效记录列表，是否有失效引用）。"""
+    by_id = _validate_state(state.order_ids, state.clauses)
+    _validate_review_records(reviews)
+    valid = _valid_review_ids(state.order_ids, by_id, reviews)
+    pos_by_id = {clause_id: i + 1 for i, clause_id in enumerate(state.order_ids)}
+    unreviewed: list[dict] = []
+    for display, clause_id in enumerate(state.order_ids, 1):
+        if clause_id in valid:
+            continue
+        unreviewed.append(
+            {
+                "id": clause_id,
+                "original": int(clause_id[1:]),
+                "current_no": display,
+            }
+        )
+    by_record = {rec.id: rec for rec in reviews}
+    valid_records = [
+        {"id": cid, "bodies": dict(by_record[cid].bodies), "current_no": pos_by_id[cid]}
+        for cid in state.order_ids
+        if cid in valid
+    ]
+    has_broken = any(
+        m.group(1) not in by_id
+        for clause_id in state.order_ids
+        for m in MARKER_RE.finditer(by_id[clause_id].body)
+    )
+    return unreviewed, valid_records, has_broken
+
+
+@app.post("/api/review")
+def review_clause(payload: ReviewIn):
+    """对一条**已保存正文**建立复核记录：记下稳定身份与当刻自身及全部可达条款的内部正文。
+
+    只读接口：不改草稿、基线、身份上界、引用绑定或存档；记录由调用方自行保存（页面内存）。
+    目标身份不存在或草稿结构非法时 422 拒绝。
+    """
+    by_id = _validate_state(payload.order_ids, payload.clauses)
+    if payload.review_id not in by_id:
+        raise HTTPException(422, detail={"errors": [f"被复核条款不存在：{payload.review_id}"]})
+    rec = _build_review_record(by_id, payload.review_id)
+    return {"review": {"id": rec.id, "bodies": rec.bodies}}
+
+
+@app.post("/api/review/status")
+def review_status(payload: ReviewStatusIn):
+    """核对草稿与全部复核记录，返回按当前顺序排列的未复核项、仍有效记录与失效引用标记。
+
+    已失效或身份已不存在的记录不报错、直接不出现在 ``valid_reviews`` 中（由调用方清除）；
+    结构损坏的记录 422 拒绝；只读，不改草稿与存档。
+    """
+    unreviewed, valid_records, has_broken = _review_status_payload(payload.draft, payload.reviews)
+    return {
+        "unreviewed": unreviewed,
+        "valid_reviews": valid_records,
+        "reviewed_all": not unreviewed,
+        "has_broken_refs": has_broken,
+        "can_export": not unreviewed and not has_broken,
+    }
+
+
+@app.post("/api/review/export")
+def review_export(payload: ReviewExportIn):
+    """全部现存条款均有有效复核记录且无失效引用时，返回复核稿文本。
+
+    文本沿用整稿导出（``/api/export``）同一格式（``新编号|解析后正文``）；
+    尚有未复核条款或存在失效引用时 409（分别附未复核项 / 失效引用来源）。只读。
+    """
+    state = payload.draft
+    by_id = _validate_state(state.order_ids, state.clauses)
+    _validate_review_records(payload.reviews)
+    valid = _valid_review_ids(state.order_ids, by_id, payload.reviews)
+    unreviewed = [cid for cid in state.order_ids if cid not in valid]
+    if unreviewed:
+        items = "、".join(
+            f"第 {state.order_ids.index(cid) + 1} 条（{cid}）" for cid in unreviewed
+        )
+        raise HTTPException(
+            409,
+            detail={"errors": [f"尚有未复核条款，复核稿拒绝导出：{items}"], "unreviewed": unreviewed},
+        )
+    pos_by_id = {clause_id: i + 1 for i, clause_id in enumerate(state.order_ids)}
+    lines = []
+    sources: list[str] = []
+    for display, clause_id in enumerate(state.order_ids, 1):
+        clause = by_id[clause_id]
+        text, broken = resolve_body(clause.body, pos_by_id)
+        if broken:
+            originals = "、".join(f"[[原{b['original']}?]]" for b in broken)
+            sources.append(f"第 {display} 条（原第 {clause_id[1:]} 条）含失效引用 {originals}")
+        lines.append(f"{display}|{text}")
+    if sources:
+        raise HTTPException(
+            409,
+            detail={"errors": ["存在失效引用，修复前禁止下载复核稿", *sources]},
+        )
+    return {"text": "\n".join(lines)}
 
 
 # --------------------------------------------------------------------------- #

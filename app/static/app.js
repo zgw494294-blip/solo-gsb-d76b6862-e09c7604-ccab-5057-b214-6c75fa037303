@@ -45,6 +45,15 @@ const state = {
   archiveError: null, // 最近一次存档操作失败的错误信息（数组）
   archiveConflict: null, // 最近一次 409 冲突时服务端的当前版本（数字）；读取最新版本或保存 / 恢复成功后清空
   archiveNotice: null, // 存档提示（如"已读取最新版本 v3"、"服务端暂无存档"）
+  reviews: new Map(), // 逐条复核记录：稳定身份 -> { id, bodies（当刻自身及全部可达条款的内部正文）}；
+  // 只存本页内存：重新导入、成功恢复存档或刷新后清空；改稿成功后由 /api/review/status
+  // 核对结果清除失效条目（清除后改回旧文也不自动恢复，新条款默认未复核）
+  lastReviewStatus: null, // 最近一次与当前草稿一致的 /api/review/status 响应（未复核项列表等）
+  reviewFresh: false, // 复核状态是否已追上当前已保存草稿（改稿立即为 false，状态响应到达后为 true）
+  reviewError: null, // 最近一次复核状态 / 复核稿导出失败的错误信息（数组）；成功一次后清空
+  reviewingId: null, // /api/review 建立单条记录时，正在复核的条款 id（同一时刻只允许一条）
+  exportingReview: false, // /api/review/export 复核稿下载在途
+  reviewPanelOpen: false, // 逐条复核面板是否展开
 };
 
 const MAX_CLAUSES = 40; // 与后端 MAX_LINES 一致：拆分后总数不能超过它
@@ -59,6 +68,10 @@ let diffInFlight = false; // 是否已有 /api/diff 在途：防止重复提交
 let refsSeq = 0; // 「谁引用本条」请求序号：只采用最后一次发出的响应，迟到响应不得恢复旧结果
 let refsInFlight = false; // 是否已有 /api/referrers 在途：防止重复提交
 let excerptSeq = 0; // 摘录请求序号：改稿 / 切换勾选 / 重新导入 / 新请求都会推进，迟到响应一律丢弃
+let reviewSeq = 0; // 复核状态请求序号：改稿 / 重新导入 / 新请求都会推进，迟到响应一律丢弃
+let reviewInFlight = false; // 是否已有 /api/review/status 在途：防止重复提交
+let reviewPostSeq = 0; // 单条复核建立请求序号：只采用最后一次发出的响应
+let reviewExportSeq = 0; // 复核稿下载请求序号：只有仍持有它的请求能收尾与保存文件
 
 const MARKER = /\[\[(?:原(\d+)\?|(\d+))\]\]/g; // 预览文本中的引用形态
 
@@ -93,6 +106,12 @@ const archiveSaveBtn = $("#archive-save-btn");
 const archiveRestoreBtn = $("#archive-restore-btn");
 const archiveRestoreImportBtn = $("#archive-restore-import-btn");
 const archiveBanner = $("#archive-banner");
+const reviewBtn = $("#review-btn");
+const reviewPanel = $("#review-panel");
+const reviewStatus = $("#review-status");
+const reviewBanner = $("#review-banner");
+const reviewBody = $("#review-body");
+const reviewDownloadBtn = $("#review-download-btn");
 
 // --------------------------------------------------------------------------- //
 // 工具
@@ -184,11 +203,22 @@ function touch() {
   state.refsError = null;
   // 勾选条款摘录同理：改稿立即清空旧结果与提示，在途请求的迟到响应一律丢弃
   clearExcerpt();
+  // 逐条复核同理：改稿后旧核对立即失效，按最新已保存草稿重新核对；失效记录由
+  // 服务端核对结果清除，迟到响应不能恢复它们。取消编辑 / 保存失败不经过 touch()
+  state.reviewFresh = false;
+  state.reviewError = null;
+  state.lastReviewStatus = null;
+  reviewSeq += 1;
+  reviewInFlight = false;
   syncToolbar();
   syncDiffPanel();
   syncReferrers();
+  syncReviewCards();
+  syncReviewPanel();
+  updateReviewDownloadBtn();
   if (state.diffOpen) refreshDiff();
   if (state.refsId) refreshReferrers(); // 面板展开时按最新已保存草稿重新查询
+  refreshReviewStatus(); // 按最新已保存草稿重新核对；无草稿时自行空转
 }
 
 function syncToolbar() {
@@ -197,6 +227,8 @@ function syncToolbar() {
   updateExcerptBtn();
   updateDownloadBtn();
   syncArchiveUi();
+  syncReviewPanel();
+  updateReviewDownloadBtn();
   syncBusy();
 }
 
@@ -602,6 +634,11 @@ function installArchive(snap, version) {
   state.refsError = null;
   state.refsFresh = false;
   clearExcerpt();
+  // 成功恢复存档：复核记录只存本页内存、不在存档协议内，一律清空后从头复核
+  clearReviews();
+  state.reviewPanelOpen = false;
+  reviewPanel.hidden = true;
+  reviewBtn.textContent = "逐条复核";
   state.diffData = null;
   state.diffError = null;
   state.diffFresh = false;
@@ -688,6 +725,11 @@ importBtn.addEventListener("click", async () => {
     state.archiveNotice = null;
     state.epoch += 1; // 新草稿世代：上一草稿的在途请求全部作废
     previewInFlight = false;
+    // 复核记录只存本页内存：新草稿默认全部未复核，旧记录与在途核对 / 下载一律清空
+    clearReviews();
+    state.reviewPanelOpen = false;
+    reviewPanel.hidden = true;
+    reviewBtn.textContent = "逐条复核";
     touch();
     importErrors.hidden = true;
     importPanel.hidden = true;
@@ -750,6 +792,11 @@ $("#reimport-btn").addEventListener("click", () => {
   state.archiveNotice = null;
   state.archiving = false;
   state.restoring = false;
+  // 重新导入清空全部复核记录（记录只存本页内存，且不属存档协议）
+  clearReviews();
+  state.reviewPanelOpen = false;
+  reviewPanel.hidden = true;
+  reviewBtn.textContent = "逐条复核";
   writeSeq += 1; // 作废旧写稿请求：其成功 / 失败 / 收尾不得改新稿或解除新请求的等待状态
   state.exporting = false;
   exportSeq += 1; // 作废旧下载对等待状态的收尾权：其成功或失败都不得解锁新草稿的下载按钮
@@ -866,6 +913,10 @@ async function renderPreview(epoch, rev, seq) {
         <span class="num">${item.display}</span>
         <span class="orig">（原第 ${item.original} 条）</span>
         ${item.broken.length ? '<span class="warn-tag">含失效引用</span>' : ""}
+        <span class="review-tag" data-role="review-tag"
+          ${state.reviews.has(item.id) ? "" : "hidden"}>${
+          state.reviews.has(item.id) ? "已复核" : ""
+        }</span>
         <span class="card-actions">
           ${
             isEditing || isSplitting
@@ -888,6 +939,11 @@ async function renderPreview(epoch, rev, seq) {
                        ? `条款总数已达 ${MAX_CLAUSES} 条上限，不能再拆分`
                        : "在选定分界处把本条已保存正文拆成前后两条"
                    }">拆分</button>
+                 <button data-action="review" ${
+                   locked || !state.previewFresh || state.reviewingId !== null ? "disabled" : ""
+                 } title="记录本条及全部可达引用条款的当前正文；它们变化后本条复核自动失效">${
+                   state.reviews.has(item.id) ? "重新复核" : "复核"
+                 }</button>
                  <button data-action="delete" class="danger" ${
                    locked ? "disabled" : ""
                  }>删除</button>`
@@ -950,6 +1006,11 @@ async function renderPreview(epoch, rev, seq) {
     if (state.refsError && !refsInFlight) refreshReferrers();
     else syncReferrers();
   }
+
+  // 逐条复核的角标 / 按钮随卡片重建重挂（复核状态请求独立于预览，不随预览失败而清空）
+  syncReviewCards();
+  syncReviewPanel();
+  updateReviewDownloadBtn();
 
   attachDnd();
 }
@@ -2112,6 +2173,357 @@ downloadBtn.addEventListener("click", async () => {
     if (token === exportSeq) {
       state.exporting = false;
       syncToolbar(); // 按当前草稿与预览状态恢复（可重试 / 可再次下载）
+    }
+  }
+});
+
+// --------------------------------------------------------------------------- //
+// 逐条复核（记录只存本页内存；服务端核对，不改草稿、基线、身份上界或存档协议）
+// --------------------------------------------------------------------------- //
+// 复核记录的有效期由服务端 /api/review/status 按“当前已保存草稿”核对：
+// - 纯重排 / 编号平移：内部正文与可达集合不变，记录保持有效；
+// - 自身或可达条款正文被编辑 / 合并 / 拆分 / 复制改写、引用目标被删除（集合变化）：失效，
+//   本地据返回的 valid_reviews 立即清除——清除后即使改回旧文也不自动恢复；
+// - 与本条不可达的改动（无关条款）不影响其记录；新条款（拆分后段 / 副本）默认未复核。
+// 改稿（touch）立即标记未追上并按最新草稿重新核对；在途响应按 rev / seq 归属，
+// 迟到响应既不能恢复已清除的记录，也不在新稿上弹错误提示。
+function reviewsPayload() {
+  return [...state.reviews.values()].map((rec) => ({ id: rec.id, bodies: rec.bodies }));
+}
+
+// 复核是否允许操作：只针对已保存正文——编辑 / 拆分选择 / 写稿未结束，
+// 或预览尚未与当前草稿同步时，不能复核或下载复核稿
+function reviewBlocked() {
+  return (
+    state.editingId !== null ||
+    state.splittingId !== null ||
+    state.writing !== null ||
+    !state.previewFresh
+  );
+}
+
+function clearReviews() {
+  // 重新导入 / 成功恢复存档 / 刷新：全部复核记录清空，在途请求一律作废
+  state.reviews = new Map();
+  state.lastReviewStatus = null;
+  state.reviewFresh = false;
+  state.reviewError = null;
+  state.reviewingId = null;
+  state.exportingReview = false;
+  reviewSeq += 1;
+  reviewPostSeq += 1;
+  reviewExportSeq += 1;
+  reviewInFlight = false;
+  syncReviewCards();
+  syncReviewPanel();
+  updateReviewDownloadBtn();
+}
+
+async function refreshReviewStatus() {
+  if (!state.orderIds.length) return;
+  const seq = ++reviewSeq;
+  const rev = state.rev;
+  reviewInFlight = true;
+  syncReviewPanel();
+  syncReviewCards();
+  let data;
+  try {
+    data = await api("/api/review/status", { draft: snapshot(), reviews: reviewsPayload() });
+  } catch (e) {
+    // 迟到响应（草稿已再改动 / 已重新导入 / 被更新请求取代）不提示，也不清新请求的在途态
+    if (seq !== reviewSeq || rev !== state.rev) return;
+    reviewInFlight = false;
+    state.reviewFresh = false;
+    state.reviewError = errorList(e);
+    syncReviewPanel();
+    syncReviewCards();
+    return;
+  }
+  if (seq !== reviewSeq || rev !== state.rev) return; // 草稿已变化：旧核对结果不得清除新稿记录
+  reviewInFlight = false;
+  if (
+    !data ||
+    !Array.isArray(data.unreviewed) ||
+    !Array.isArray(data.valid_reviews)
+  ) {
+    state.reviewFresh = false;
+    state.reviewError = ["复核状态响应正文不完整，请重试。"];
+    syncReviewPanel();
+    syncReviewCards();
+    return;
+  }
+  // 按服务端核对结果修剪本地记录：失效 / 身份已消失的条目立即清除（不自动恢复）
+  const validIds = new Set(data.valid_reviews.map((rec) => rec.id));
+  for (const id of [...state.reviews.keys()]) {
+    if (!validIds.has(id)) state.reviews.delete(id);
+  }
+  state.reviewError = null;
+  state.reviewFresh = true;
+  state.lastReviewStatus = data;
+  syncReviewCards();
+  syncReviewPanel();
+  updateReviewDownloadBtn();
+}
+
+// 卡片上的「复核」按钮与“已复核 / 已失效待复核”角标：预览重建后据此重挂
+function syncReviewCards() {
+  document.querySelectorAll(".card").forEach((card) => {
+    const id = card.dataset.id;
+    const tag = card.querySelector('[data-role="review-tag"]');
+    if (tag) {
+      const reviewed = state.reviews.has(id);
+      tag.hidden = !reviewed;
+      tag.textContent = reviewed ? "已复核" : "";
+      tag.classList.toggle("stale", reviewed && !state.reviewFresh);
+      tag.title = reviewed && !state.reviewFresh ? "草稿已有改动，正在重新核对该复核是否仍有效" : "";
+    }
+    const btn = card.querySelector('[data-action="review"]');
+    if (!btn) return;
+    if (state.reviewingId === id) {
+      btn.disabled = true;
+      btn.textContent = "复核中…";
+    } else if (state.reviewingId !== null) {
+      btn.disabled = true; // 另一条正在复核：其余卡片的复核按钮暂时禁用
+      btn.textContent = state.reviews.has(id) ? "重新复核" : "复核";
+    } else {
+      btn.disabled = reviewBlocked();
+      btn.textContent = state.reviews.has(id) ? "重新复核" : "复核";
+    }
+  });
+}
+
+function reviewUnreviewedItems() {
+  // 未复核项以服务端最近一次核对结果为准；尚未核对成功时一律视为全部未复核
+  if (!state.reviewFresh || !state.lastReviewStatus) {
+    return state.orderIds.map((id, i) => ({
+      id,
+      original: parseInt(id.slice(1), 10),
+      current_no: i + 1,
+    }));
+  }
+  return state.lastReviewStatus.unreviewed;
+}
+
+function syncReviewPanel() {
+  if (!state.reviewPanelOpen) return;
+  reviewPanel.hidden = false;
+  reviewBtn.textContent = "收起复核";
+
+  if (state.reviewError) {
+    reviewBanner.hidden = false;
+    reviewBanner.innerHTML =
+      `<strong>复核状态核对失败。</strong>已保存草稿未受影响，复核记录未改动：` +
+      `<ul>${state.reviewError.map((m) => `<li>${esc(m)}</li>`).join("")}</ul>` +
+      `<div class="preview-error-actions"><button type="button" class="primary"
+        data-action="review-retry"${reviewInFlight ? " disabled" : ""}>${
+        reviewInFlight ? "核对中…" : "重新核对"
+      }</button></div>`;
+  } else {
+    reviewBanner.hidden = true;
+    reviewBanner.textContent = "";
+  }
+
+  const items = reviewUnreviewedItems();
+  const total = state.orderIds.length;
+  const done = total - items.length;
+  const broken = state.previewFresh && state.preview ? state.preview.has_broken : null;
+
+  if (!state.reviewFresh) {
+    reviewStatus.textContent = reviewInFlight ? "正在按当前草稿核对…" : "复核状态已过期，正在重新核对…";
+    reviewStatus.className = "review-status is-stale";
+  } else if (items.length === 0 && !broken) {
+    reviewStatus.textContent = `全部 ${total} 条均已复核，无失效引用，可下载复核稿`;
+    reviewStatus.className = "review-status is-fresh";
+  } else {
+    reviewStatus.textContent = `已复核 ${done} / ${total} 条`;
+    reviewStatus.className = "review-status is-stale";
+  }
+
+  const parts = [];
+  if (items.length) {
+    parts.push(
+      `<h3 class="review-subhead">未复核条款（${items.length}）</h3>` +
+        `<ul class="review-list">${items
+          .map(
+            (it) =>
+              `<li><button type="button" class="ref" data-goto="${esc(it.id)}">第 ${it.current_no} 条</button>` +
+              `<span class="diff-id">（稳定身份 ${esc(it.id)}，原第 ${it.original} 条）</span></li>`,
+          )
+          .join("")}</ul>`,
+    );
+  } else if (state.reviewFresh) {
+    parts.push('<p class="review-empty">全部现存条款均已复核。</p>');
+  }
+  if (broken) {
+    parts.push(
+      '<p class="review-broken-note">当前草稿存在失效引用：即使全部条款已复核，也须先修复失效引用才能下载复核稿。</p>',
+    );
+  }
+  if (!state.reviewFresh && !state.reviewError) {
+    parts.push('<p class="review-empty">正在核对…</p>');
+  }
+  reviewBody.innerHTML = parts.join("");
+  updateReviewDownloadBtn();
+}
+
+function updateReviewDownloadBtn() {
+  const fresh = state.reviewFresh && state.lastReviewStatus;
+  const allReviewed = fresh && state.lastReviewStatus.unreviewed.length === 0;
+  const noBroken = state.previewFresh && state.preview && !state.preview.has_broken;
+  if (state.exportingReview) {
+    reviewDownloadBtn.disabled = true;
+    reviewDownloadBtn.textContent = "下载中…";
+    return;
+  }
+  reviewDownloadBtn.disabled =
+    reviewBlocked() ||
+    state.reviewingId !== null ||
+    !allReviewed ||
+    !noBroken;
+  reviewDownloadBtn.textContent = "下载复核稿";
+  reviewDownloadBtn.title = !fresh
+    ? "复核状态尚未与当前草稿同步"
+    : !allReviewed
+      ? "尚有条款未复核"
+      : !noBroken
+        ? "存在失效引用，修复后才能下载"
+        : "按整稿导出格式下载复核稿";
+}
+
+// 面板开关 / 重试 / 收起
+reviewBtn.addEventListener("click", () => {
+  state.reviewPanelOpen = !state.reviewPanelOpen;
+  if (state.reviewPanelOpen) {
+    reviewPanel.hidden = false;
+    reviewBtn.textContent = "收起复核";
+    if (!state.reviewFresh) refreshReviewStatus();
+    else syncReviewPanel();
+  } else {
+    reviewPanel.hidden = true;
+    reviewBtn.textContent = "逐条复核";
+    reviewSeq += 1; // 收起后在途响应回来也不再采用
+    reviewInFlight = false;
+  }
+});
+
+$("#review-close-btn").addEventListener("click", () => {
+  state.reviewPanelOpen = false;
+  reviewPanel.hidden = true;
+  reviewBtn.textContent = "逐条复核";
+  reviewSeq += 1;
+  reviewInFlight = false;
+});
+
+$("#review-refresh-btn").addEventListener("click", () => {
+  if (!reviewInFlight) refreshReviewStatus();
+});
+
+reviewBanner.addEventListener("click", (ev) => {
+  const btn = ev.target.closest('[data-action="review-retry"]');
+  if (btn && !reviewInFlight) refreshReviewStatus();
+});
+
+// 未复核列表中的定位：复用列表统一的 data-goto 处理（预览锁定时由其自行拦截）
+reviewBody.addEventListener("click", (ev) => {
+  const goto = ev.target.closest("[data-goto]");
+  if (!goto) return;
+  if (listLocked()) return;
+  const card = document.getElementById(`card-${goto.dataset.goto}`);
+  if (card) {
+    card.scrollIntoView({ behavior: "smooth", block: "center" });
+    card.classList.remove("flash");
+    void card.offsetWidth;
+    card.classList.add("flash");
+  }
+});
+
+// 建立单条复核记录（只针对已保存正文；只读请求，不改草稿）
+async function submitReview(id) {
+  if (state.reviewingId || reviewBlocked()) return;
+  const token = ++reviewPostSeq;
+  const epoch = state.epoch;
+  const rev = state.rev;
+  state.reviewingId = id;
+  syncReviewCards();
+  updateReviewDownloadBtn();
+  let data;
+  try {
+    data = await api("/api/review", { ...snapshot(), review_id: id });
+  } catch (e) {
+    if (token !== reviewPostSeq || epoch !== state.epoch || rev !== state.rev) return;
+    state.reviewingId = null;
+    syncReviewCards();
+    updateReviewDownloadBtn();
+    alert("复核失败，草稿与已有复核记录均未改动：\n" + errorList(e).join("\n"));
+    return;
+  }
+  // 换稿 / 改稿后迟到的成功响应不得写入新草稿的记录（新稿会在状态刷新中重新核对）
+  if (token !== reviewPostSeq || epoch !== state.epoch || rev !== state.rev) return;
+  state.reviewingId = null;
+  if (data && data.review && data.review.id === id && data.review.bodies) {
+    state.reviews.set(id, { id, bodies: data.review.bodies });
+    // 立即按当前草稿核对一次（服务端确认该条有效并同步未复核列表）
+    syncReviewCards();
+    refreshReviewStatus();
+  } else {
+    state.reviewError = ["复核响应正文不完整，请重试。"];
+    syncReviewCards();
+    syncReviewPanel();
+  }
+  updateReviewDownloadBtn();
+}
+
+// 卡片按钮：逐条复核
+clauseList.addEventListener("click", (ev) => {
+  const btn = ev.target.closest('[data-action="review"]');
+  if (!btn) return;
+  const card = btn.closest(".card");
+  if (!card) return;
+  if (reviewBlocked() || state.reviewingId) return; // 未保存编辑 / 拆分 / 写稿 / 预览未同步时不能复核
+  submitReview(card.dataset.id);
+});
+
+// 下载复核稿：与整稿下载同一套竞态规则——只有仍持有收尾权的响应能保存文件与解锁；
+// 等待期间改稿（rev 变化）或换稿（epoch 变化）时，旧响应静默丢弃，不保存旧文件、
+// 不弹提示，也不影响新操作（含新一次复核稿下载）
+reviewDownloadBtn.addEventListener("click", async () => {
+  if (reviewDownloadBtn.disabled) return;
+  const token = ++reviewExportSeq;
+  const epoch = state.epoch;
+  const rev = state.rev;
+  state.exportingReview = true;
+  updateReviewDownloadBtn();
+  try {
+    const data = await api("/api/review/export", {
+      draft: snapshot(),
+      reviews: reviewsPayload(),
+    });
+    if (token !== reviewExportSeq || epoch !== state.epoch) return; // 换稿 / 被新下载取代：静默丢弃
+    if (rev !== state.rev) return; // 等待期间改稿：旧响应静默丢弃，不保存文件、不弹提示
+    if (!data || typeof data.text !== "string") {
+      alert("复核稿响应正文不完整，请重试。");
+      return;
+    }
+    const blob = new Blob([data.text], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-");
+    a.href = url;
+    a.download = `reviewed-clauses-${stamp}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    if (token !== reviewExportSeq || epoch !== state.epoch || rev !== state.rev) return;
+    // 409（尚有未复核条款 / 存在失效引用）或其他失败：不保存文件，弹窗给出原因，
+    // 并立即按当前草稿重新核对（成功后自动清掉这里的横幅错误并刷新未复核列表）
+    state.reviewError = errorList(e);
+    syncReviewPanel();
+    alert(errorList(e).join("\n"));
+    refreshReviewStatus();
+  } finally {
+    if (token === reviewExportSeq) {
+      state.exportingReview = false;
+      updateReviewDownloadBtn();
     }
   }
 });

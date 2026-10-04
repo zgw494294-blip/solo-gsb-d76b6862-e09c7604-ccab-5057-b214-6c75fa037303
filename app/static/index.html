@@ -9,7 +9,7 @@
 <body>
   <header class="topbar">
     <h1>条款重排校稿台</h1>
-    <p class="subtitle">粘贴“编号|正文”导入 · 重排 / 合并 / 拆分 / 删除后引用始终绑定原条款 · 修复全部失效引用后才能下载</p>
+    <p class="subtitle">粘贴“编号|正文”导入 · 重排 / 合并 / 拆分 / 删除后引用始终绑定原条款 · 逐条复核全部现存条款且修复失效引用后可下载复核稿</p>
   </header>
 
   <main>
@@ -46,6 +46,7 @@
           <button id="duplicate-btn" disabled>复制所选</button>
           <button id="excerpt-btn" disabled>导出摘录</button>
           <button id="diff-btn">对照原稿</button>
+          <button id="review-btn">逐条复核</button>
           <button id="reimport-btn">重新导入</button>
           <button id="download-btn" class="primary" disabled>下载纯文本</button>
         </div>
@@ -90,6 +91,30 @@
         </p>
         <div id="excerpt-banner" class="banner excerpt-banner" hidden></div>
         <div id="excerpt-body"></div>
+      </section>
+
+      <!-- 逐条复核：对已保存正文逐条建立复核记录，全部现存条款已复核且无失效引用后可下载复核稿 -->
+      <section id="review-panel" class="panel review-panel" hidden>
+        <div class="review-head">
+          <h2>逐条复核</h2>
+          <div class="review-status" id="review-status"></div>
+        </div>
+        <p class="hint">
+          复核只针对<strong>已保存正文</strong>：每条记录保存其稳定身份与复核当刻它自身及沿引用可达的
+          全部现存条款的正文（循环只计一次）。<b>纯重排、编号平移与无关条款的改动不影响复核</b>；
+          自身或其引用到的条款正文发生变化、引用目标被删除 / 合并 / 拆分 / 复制改写时，相关复核自动清除
+          （即使之后改回旧文也不自动恢复，需重新复核）；拆分 / 复制产生的新条款默认未复核。
+          记录只存在本页内存中：重新导入、成功恢复存档或刷新页面后清空，不写入存档。
+          <strong>全部现存条款均已复核且无失效引用</strong>后，才可下载复核稿（格式与整稿导出一致）。
+          未完成编辑 / 拆分 / 写稿或预览未同步时不能复核、下载。
+        </p>
+        <div id="review-banner" class="banner review-banner" hidden></div>
+        <div id="review-body"></div>
+        <div class="review-actions">
+          <button id="review-download-btn" class="primary" type="button" disabled>下载复核稿</button>
+          <button id="review-refresh-btn" type="button">重新核对</button>
+          <button id="review-close-btn" type="button">收起</button>
+        </div>
       </section>
 
       <div class="columns">

@@ -1,3 +1,5 @@
+import copy
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -1292,6 +1294,224 @@ def test_excerpt_does_not_modify_draft():
     assert r.status_code == 200
     # 只读接口：草稿、顺序与引用绑定均不被改动
     assert payload == {**state, "selected_ids": ["c3"]}
+
+
+# --------------------------------------------------------------------------- #
+# 逐条复核 /api/review、/api/review/status、/api/review/export
+# --------------------------------------------------------------------------- #
+def _review_state(text=None):
+    doc = import_text(text or GOOD).json()
+    return {"order_ids": [c["id"] for c in doc["clauses"]], "clauses": _bodies(doc)}
+
+
+def _make_review(state, review_id):
+    r = client.post("/api/review", json={**state, "review_id": review_id})
+    assert r.status_code == 200, r.text
+    return r.json()["review"]
+
+
+def _review_all(state):
+    return [_make_review(state, cid) for cid in state["order_ids"]]
+
+
+def _review_status(state, reviews):
+    return client.post("/api/review/status", json={"draft": state, "reviews": reviews})
+
+
+def test_review_records_self_and_all_reachable_clause_bodies_with_cycle_once():
+    # c2 引用 c1；c3 引用 c4 与 c2（可达 c4,c2,c1）；自引用 / 循环只计一次
+    text = "\n".join(
+        [
+            "1|甲",
+            "2|见 [[1]] 与 [[3]]",
+            "3|见 [[4]] 与 [[2]]，再说 [[4]]",
+            "4|自引 [[4]]",
+        ]
+    )
+    state = _review_state(text)
+    rec = _make_review(state, "c3")
+    assert set(rec["bodies"]) == {"c1", "c2", "c3", "c4"}  # 重复引用 [[4]] 只计一次
+    assert rec["bodies"]["c3"] == "见 [[c4]] 与 [[c2]]，再说 [[c4]]"
+    rec4 = _make_review(state, "c4")
+    assert set(rec4["bodies"]) == {"c4"}  # 自引用只收录自身一次
+
+
+def test_review_status_lists_unreviewed_in_current_order_and_can_export():
+    state = _review_state()
+    recs = _review_all(state)
+    r = _review_status(state, recs)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["unreviewed"] == []
+    assert data["reviewed_all"] is True
+    assert data["has_broken_refs"] is False
+    assert data["can_export"] is True
+    assert [v["id"] for v in data["valid_reviews"]] == ["c1", "c2", "c3", "c4"]
+
+    # 只复核一部分：未复核项按当前顺序列出
+    r = _review_status(state, [recs[0], recs[3]])
+    data = r.json()
+    assert [u["id"] for u in data["unreviewed"]] == ["c2", "c3"]
+    assert [u["current_no"] for u in data["unreviewed"]] == [2, 3]
+    assert data["can_export"] is False
+
+
+def test_review_pure_reorder_and_number_shift_keeps_reviews():
+    state = _review_state()
+    recs = _review_all(state)
+    reordered = {**state, "order_ids": ["c4", "c1", "c2", "c3"]}
+    data = _review_status(reordered, recs).json()
+    assert data["unreviewed"] == []  # 内部正文不变：纯重排不影响复核
+    # 有效记录的 current_no 按当前顺序给出
+    nos = {v["id"]: v["current_no"] for v in data["valid_reviews"]}
+    assert nos == {"c1": 2, "c2": 3, "c3": 4, "c4": 1}
+    r = client.post("/api/review/export", json={"draft": reordered, "reviews": recs})
+    assert r.status_code == 200
+    assert r.json()["text"].splitlines()[0] == "1|争议提交仲裁"
+
+
+def test_review_invalidated_by_self_body_change_and_reachable_target_change():
+    state = _review_state()  # c2 -> c1；c3 -> c4,c2；c4 无引用
+    recs = {cid: _make_review(state, cid) for cid in state["order_ids"]}
+
+    # c2 自身正文变化：c2 失效；c3 可达 c2，也失效；c1、c4 不受影响
+    bodies = [dict(b) for b in state["clauses"]]
+    bodies[1]["body"] = "乙方改了正文，仍按 [[c1]] 验收"
+    changed = {**state, "clauses": bodies}
+    data = _review_status(changed, list(recs.values())).json()
+    assert [u["id"] for u in data["unreviewed"]] == ["c2", "c3"]
+
+    # 清除后改回旧文也不自动恢复：记录重新核对仍以当前草稿为准——这里恢复旧文，
+    # 但已被前端清除的记录不会自动复活；直接再核对时（记录仍由调用方持有时）内容一致则有效。
+    # 关键语义：是否有效只看当前内容与记录是否一致，不存在“清除锁”；清除动作由调用方执行。
+    data2 = _review_status(state, list(recs.values())).json()
+    assert data2["unreviewed"] == []
+
+
+def test_review_cleared_record_is_not_restored_after_reverting_text():
+    # 模拟前端在改稿成功后“清除该条复核”：把该记录从 reviews 中移除；
+    # 即使正文改回旧文，被移除的记录也不会自动重新出现，必须重新复核。
+    state = _review_state()
+    recs = _review_all(state)
+    bodies = [dict(b) for b in state["clauses"]]
+    bodies[1]["body"] = "乙方改了正文"
+    changed = {**state, "clauses": bodies}
+    # 改稿后前端按返回的有效列表清除 c2/c3
+    valid = {v["id"] for v in _review_status(changed, recs).json()["valid_reviews"]}
+    kept = [r for r in recs if r["id"] in valid]
+    assert {r["id"] for r in kept} == {"c1", "c4"}
+    # 把 c2 正文改回旧文（c2 已不在 kept 中）：有效记录集合不变，c2 仍需重新复核
+    reverted = {**state}
+    data = _review_status(reverted, kept).json()
+    assert [u["id"] for u in data["unreviewed"]] == ["c2", "c3"]
+    fresh = kept + [_make_review(reverted, "c2"), _make_review(reverted, "c3")]
+    assert _review_status(reverted, fresh).json()["unreviewed"] == []
+
+
+def test_review_unrelated_change_keeps_review():
+    # c1 的复核闭包只有自身；不可达条款 c2 的正文变化不影响 c1 的复核
+    state = _review_state()
+    rec1 = _make_review(state, "c1")
+    bodies = [dict(b) for b in state["clauses"]]
+    bodies[1]["body"] = "乙方改成完全不同的正文 [[c4]]"
+    changed = {**state, "clauses": bodies}
+    data = _review_status(changed, [rec1]).json()
+    assert [u["id"] for u in data["unreviewed"]] == ["c2", "c3", "c4"]
+    assert [v["id"] for v in data["valid_reviews"]] == ["c1"]
+
+
+def test_review_delete_target_invalidates_dependent_records_and_blocks_export():
+    state = _review_state()
+    recs = _review_all(state)
+    # 删除 c4：c4 的记录消失；c3 引用 c4（闭包缩小）失效；c1 不依赖 c4 仍有效
+    order = [cid for cid in state["order_ids"] if cid != "c4"]
+    bodies = [b for b in state["clauses"] if b["id"] != "c4"]
+    deleted = {"order_ids": order, "clauses": bodies}
+    data = _review_status(deleted, recs).json()
+    assert [u["id"] for u in data["unreviewed"]] == ["c3"]  # c4 已不是现存条款，不列入
+    assert data["has_broken_refs"] is True
+    assert data["can_export"] is False
+    # 未复核时导出 409 并附 unreviewed（未复核优先于失效引用拦截）
+    r = client.post("/api/review/export", json={"draft": deleted, "reviews": recs})
+    assert r.status_code == 409
+    assert set(r.json()["detail"]["unreviewed"]) == {"c3"}
+    # 失效引用未修复前，即使全部现存条款都重新复核，导出仍 409（失效引用拦截）
+    new_recs = [_make_review(deleted, cid) for cid in order]
+    r = client.post("/api/review/export", json={"draft": deleted, "reviews": new_recs})
+    assert r.status_code == 409
+    assert "失效引用" in r.json()["detail"]["errors"][0]
+
+
+def test_review_split_front_and_back_default_unreviewed_and_front_record_invalidated():
+    state = _review_state()
+    recs = {cid: _make_review(state, cid) for cid in state["order_ids"]}
+    r = _split(state["order_ids"], state["clauses"], "c2", 2, "c5")
+    assert r.status_code == 200, r.text
+    split = r.json()
+    data = _review_status(split, list(recs.values())).json()
+    # 后段 c5 默认未复核；前段 c2 正文已变（切短），记录失效；c3 原经 c2 可达 c1，
+    # 拆分后前段不再引用 c1，闭包缩小，c3 记录也失效；c1、c4 与本次拆分无关，保持有效
+    assert [u["id"] for u in data["unreviewed"]] == ["c2", "c5", "c3"]
+    # 拆分接口只读：原草稿不变
+    assert state == _review_state()
+
+
+def test_review_duplicate_copies_default_unreviewed_and_group_refs_repointed():
+    state = _review_state()
+    recs = _review_all(state)
+    # 复制 c2、c3：副本 c5 复制 c2、c6 复制 c3。c6 中原指向组内 c2 的引用改指
+    # 相应副本 c5，指向组外 c4 的引用保留原目标；两个副本默认未复核；
+    # 原 c2、c3 的正文与可达集合均不变，记录保持有效
+    r = _dup(state["order_ids"], state["clauses"], ["c2", "c3"], 4)
+    assert r.status_code == 200, r.text
+    dup = r.json()
+    copy_c6 = next(c["body"] for c in dup["clauses"] if c["id"] == "c6")
+    assert copy_c6 == "争议解决见 [[c4]]，违约参照 [[c5]]"
+    data = _review_status(dup, recs).json()
+    assert [u["id"] for u in data["unreviewed"]] == ["c5", "c6"]
+
+
+def test_review_export_text_matches_full_export_format():
+    state = _review_state()
+    recs = _review_all(state)
+    r = client.post("/api/review/export", json={"draft": state, "reviews": recs})
+    assert r.status_code == 200
+    full = client.post("/api/export", json=state).json()["text"]
+    assert r.json()["text"] == full
+    assert r.json()["text"].splitlines()[0] == "1|甲方在七日内交付设备"
+
+
+def test_review_rejects_unknown_target_and_bad_records():
+    state = _review_state()
+    r = client.post("/api/review", json={**state, "review_id": "c9"})
+    assert r.status_code == 422
+    # 记录结构损坏：重复身份、缺自身正文、正文形态损坏
+    bad_sets = [
+        [
+            {"id": "c1", "bodies": {"c1": "甲"}},
+            {"id": "c1", "bodies": {"c1": "甲"}},
+        ],
+        [{"id": "c1", "bodies": {"c2": "乙"}}],
+        [{"id": "c1", "bodies": {"c1": "坏引用 [[9]]"}}],
+        [{"id": "x1", "bodies": {}}],
+    ]
+    for bad in bad_sets:
+        r = _review_status(state, bad)
+        assert r.status_code == 422, bad
+        assert r.json()["detail"]["errors"]
+
+
+def test_review_endpoints_are_read_only():
+    state = _review_state()
+    payload = copy.deepcopy(state)
+    r = client.post("/api/review", json={**payload, "review_id": "c1"})
+    assert r.status_code == 200
+    recs = _review_all(copy.deepcopy(payload))
+    r = client.post("/api/review/status", json={"draft": payload, "reviews": copy.deepcopy(recs)})
+    assert r.status_code == 200
+    r = client.post("/api/review/export", json={"draft": payload, "reviews": recs})
+    assert r.status_code == 200
+    assert payload == state  # 草稿未被任何复核接口改动
 
 
 # --------------------------------------------------------------------------- #

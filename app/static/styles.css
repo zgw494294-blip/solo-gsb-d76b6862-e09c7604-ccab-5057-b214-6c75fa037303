@@ -420,3 +420,47 @@ button.danger:hover:not(:disabled) { background: var(--danger-bg); }
 .archive-banner { font-size: 13.5px; }
 .archive-banner ul { margin: 8px 0 0; padding-left: 20px; }
 .archive-banner .preview-error-actions { align-items: center; }
+
+/* --------------------------------------------------------------------------- */
+/* 逐条复核（未复核列表 + 复核稿下载） */
+/* --------------------------------------------------------------------------- */
+.review-panel { border-color: #c9e5d4; background: #fbfefc; }
+.review-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.review-head h2 { margin-bottom: 4px; }
+.review-status { font-size: 12.5px; color: var(--muted); white-space: nowrap; }
+.review-status.is-fresh { color: #1d7a44; font-weight: 600; }
+.review-status.is-stale { color: #9a6a12; }
+
+.review-banner {
+  background: var(--danger-bg);
+  border-color: #f3c4c4;
+  color: var(--danger);
+  padding: 10px 14px;
+  margin: 8px 0 12px;
+}
+.review-banner ul { margin: 6px 0 0; padding-left: 20px; }
+
+.review-subhead { margin: 10px 0 6px; font-size: 14px; }
+.review-list { list-style: none; margin: 0 0 10px; padding: 0; }
+.review-list li { padding: 3px 0; font-size: 13.5px; }
+.review-empty { color: var(--muted); font-size: 13.5px; }
+.review-broken-note { color: var(--danger); font-size: 13.5px; margin: 8px 0; }
+.review-actions { display: flex; gap: 10px; margin-top: 10px; }
+
+.review-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 8px;
+  font-size: 12px;
+  line-height: 18px;
+  border-radius: 9px;
+  background: #dff3e6;
+  color: #1d7a44;
+  border: 1px solid #b7e0c6;
+  white-space: nowrap;
+}
+.review-tag.stale {
+  background: #fdf3df;
+  color: #9a6a12;
+  border-color: #ecd9a6;
+}
