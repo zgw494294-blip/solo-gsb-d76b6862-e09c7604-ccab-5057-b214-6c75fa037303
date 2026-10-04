@@ -1439,3 +1439,231 @@ def test_archive_snapshot_with_advanced_counter_roundtrips():
     r = client.put("/api/archive", json={"version": 1, "snapshot": snap_low})
     assert r.status_code == 422
 
+
+# --------------------------------------------------------------------------- #
+# 逐条复核 /api/review/check 与 /api/review/export
+# --------------------------------------------------------------------------- #
+def _rec(cid, bodies):
+    return {"id": cid, "bodies": bodies}
+
+
+def _body_map(doc):
+    return {c["id"]: c["body"] for c in doc["clauses"]}
+
+
+def _check(state, reviews):
+    return client.post("/api/review/check", json={**state, "reviews": reviews})
+
+
+def _review_export(state, reviews):
+    return client.post("/api/review/export", json={**state, "reviews": reviews})
+
+
+def test_review_check_lists_unreviewed_in_current_order():
+    doc = import_text(GOOD).json()
+    state = _state(doc, ["c4", "c1", "c2", "c3"])
+    r = _check(state, [])
+    assert r.status_code == 200, r.text
+    data = r.json()
+    # 未复核项按当前顺序排列，附稳定身份与当前编号
+    assert data["unreviewed"] == [
+        {"id": "c4", "original": 4, "current_no": 1},
+        {"id": "c1", "original": 1, "current_no": 2},
+        {"id": "c2", "original": 2, "current_no": 3},
+        {"id": "c3", "original": 3, "current_no": 4},
+    ]
+    assert data["valid_ids"] == []
+
+
+
+
+def test_review_check_accepts_record_covering_exact_closure():
+    doc = import_text(GOOD).json()
+    bodies = _body_map(doc)
+    # c2 的可达引用闭包：c2 自身 + 被引用的 c1
+    reviews = [_rec("c2", {"c2": bodies["c2"], "c1": bodies["c1"]})]
+    data = _check(_state(doc), reviews).json()
+    assert data["valid_ids"] == ["c2"]
+    assert [it["id"] for it in data["unreviewed"]] == ["c1", "c3", "c4"]
+    # c3 的闭包沿多级引用传递：c3 → c4、c2 → c1
+    reviews = [
+        _rec("c3", {"c3": bodies["c3"], "c4": bodies["c4"], "c2": bodies["c2"], "c1": bodies["c1"]})
+    ]
+    data = _check(_state(doc), reviews).json()
+    assert data["valid_ids"] == ["c3"]
+    assert [it["id"] for it in data["unreviewed"]] == ["c1", "c2", "c4"]
+
+
+def test_review_closure_counts_self_cycle_and_duplicate_refs_once():
+    doc = import_text("1|回引 [[2]]\n2|重复 [[1]][[1]]，又见 [[3]]\n3|再回 [[2]]").json()
+    bodies = _body_map(doc)
+    # c1↔c2 与 c2→c3→c2 循环、重复引用：闭包每条只计一次，恰好为 {c1, c2, c3}
+    reviews = [_rec("c2", {"c2": bodies["c2"], "c1": bodies["c1"], "c3": bodies["c3"]})]
+    data = _check(_state(doc), reviews).json()
+    assert data["valid_ids"] == ["c2"]
+    assert [it["id"] for it in data["unreviewed"]] == ["c1", "c3"]
+    # 自引用条款的闭包只有自身
+    doc2 = import_text("1|本条说明自身 [[1]]\n2|普通条款").json()
+    bodies2 = _body_map(doc2)
+    data = _check(_state(doc2), [_rec("c1", {"c1": bodies2["c1"]})]).json()
+    assert data["valid_ids"] == ["c1"]
+    assert [it["id"] for it in data["unreviewed"]] == ["c2"]
+
+
+def test_review_record_survives_reorder_number_shift_and_unrelated_change():
+    doc = import_text(GOOD).json()
+    bodies = _body_map(doc)
+    rec = _rec("c2", {"c2": bodies["c2"], "c1": bodies["c1"]})
+    # 纯重排：内部正文与目标存续均未变，记录保留
+    data = _check(_state(doc, ["c4", "c1", "c2", "c3"]), [rec]).json()
+    assert data["valid_ids"] == ["c2"]
+    # 删除无关条款 c4（其余条款编号平移）：c2 闭包不变，记录保留
+    order = ["c1", "c2", "c3"]
+    kept = [b for b in _bodies(doc) if b["id"] != "c4"]
+    data = _check({"order_ids": order, "clauses": kept}, [rec]).json()
+    assert data["valid_ids"] == ["c2"]
+    # 无关正文改动（c3 改文，不在 c2 闭包内）：记录保留
+    changed = [dict(b) for b in kept]
+    changed[2]["body"] = "争议解决见 [[c4]]，违约参照 [[c2]]；补充"
+    data = _check({"order_ids": order, "clauses": changed}, [rec]).json()
+    assert data["valid_ids"] == ["c2"]
+
+
+def test_review_record_cleared_by_closure_body_or_existence_change():
+    doc = import_text(GOOD).json()
+    bodies = _body_map(doc)
+    rec = _rec("c2", {"c2": bodies["c2"], "c1": bodies["c1"]})
+    # 闭包内正文变化（c1 改文）：记录失效，c2 重新列入未复核
+    changed = [dict(b) for b in _bodies(doc)]
+    changed[0]["body"] = "甲方改为三十日内交付设备"
+    data = _check({"order_ids": ids4(), "clauses": changed}, [rec]).json()
+    assert data["valid_ids"] == []
+    assert [it["id"] for it in data["unreviewed"]] == ids4()
+    # 目标存续变化（c1 被删除）：记录失效
+    order = ["c2", "c3", "c4"]
+    kept = [b for b in _bodies(doc) if b["id"] != "c1"]
+    data = _check({"order_ids": order, "clauses": kept}, [rec]).json()
+    assert data["valid_ids"] == []
+    # 被复核条款自身被删除：记录失效，且不列入未复核项（只列现存条款）
+    order = ["c1", "c3", "c4"]
+    kept = [b for b in _bodies(doc) if b["id"] != "c2"]
+    data = _check({"order_ids": order, "clauses": kept}, [rec]).json()
+    assert data["valid_ids"] == []
+    assert [it["id"] for it in data["unreviewed"]] == ["c1", "c3", "c4"]
+
+
+def test_review_record_must_cover_exact_closure():
+    doc = import_text(GOOD).json()
+    bodies = _body_map(doc)
+    # 漏记可达引用条款 c1：失效
+    data = _check(_state(doc), [_rec("c2", {"c2": bodies["c2"]})]).json()
+    assert data["valid_ids"] == []
+    # 多记闭包外条款 c4：失效
+    data = _check(
+        _state(doc),
+        [_rec("c2", {"c2": bodies["c2"], "c1": bodies["c1"], "c4": bodies["c4"]})],
+    ).json()
+    assert data["valid_ids"] == []
+    # 记录正文与当前正文逐字不同（哪怕只多一个标点）：失效
+    data = _check(
+        _state(doc),
+        [_rec("c2", {"c2": bodies["c2"] + "。", "c1": bodies["c1"]})],
+    ).json()
+    assert data["valid_ids"] == []
+
+
+def test_review_export_requires_all_reviewed_and_no_broken_refs():
+    doc = import_text(GOOD).json()
+    state = _state(doc)
+    bodies = _body_map(doc)
+    full = [
+        _rec("c1", {"c1": bodies["c1"]}),
+        _rec("c2", {"c2": bodies["c2"], "c1": bodies["c1"]}),
+        _rec("c3", {"c3": bodies["c3"], "c4": bodies["c4"], "c2": bodies["c2"], "c1": bodies["c1"]}),
+        _rec("c4", {"c4": bodies["c4"]}),
+    ]
+    # 有未复核条款：409，按当前顺序列出未复核项
+    r = _review_export(state, full[:2])
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert [it["id"] for it in detail["unreviewed"]] == ["c3", "c4"]
+    assert any("尚未复核" in m for m in detail["errors"])
+    # 全部现存条款已复核且无失效引用：文本与整稿导出完全一致
+    r = _review_export(state, full)
+    assert r.status_code == 200, r.text
+    plain = client.post("/api/export", json=state).json()["text"]
+    assert r.json()["text"] == plain
+    # 存在失效引用：即使全部复核也 409（c3 闭包中已失效的 c4 不计入记录）
+    order = ["c1", "c2", "c3"]
+    kept = [b for b in state["clauses"] if b["id"] != "c4"]
+    recs = [
+        _rec("c1", {"c1": bodies["c1"]}),
+        _rec("c2", {"c2": bodies["c2"], "c1": bodies["c1"]}),
+        _rec("c3", {"c3": bodies["c3"], "c2": bodies["c2"], "c1": bodies["c1"]}),
+    ]
+    r = _review_export({"order_ids": order, "clauses": kept}, recs)
+    assert r.status_code == 409
+    assert "失效引用" in r.json()["detail"]["errors"][0]
+
+
+def test_review_export_ignores_stale_records_of_deleted_clauses():
+    doc = import_text(GOOD).json()
+    state = _state(doc)
+    # 删除 c4 并修复 c3 的失效引用
+    order = ["c1", "c2", "c3"]
+    kept = [b for b in state["clauses"] if b["id"] != "c4"]
+    r = client.post(
+        "/api/save",
+        json={"order_ids": order, "clauses": kept, "edit_id": "c3", "text": "争议解决改为 [[1]]"},
+    )
+    assert r.status_code == 200
+    fixed = [
+        {"id": b["id"], "body": r.json()["body"] if b["id"] == "c3" else b["body"]} for b in kept
+    ]
+    bodies = {b["id"]: b["body"] for b in fixed}
+    reviews = [
+        _rec("c1", {"c1": bodies["c1"]}),
+        _rec("c2", {"c2": bodies["c2"], "c1": bodies["c1"]}),
+        _rec("c3", {"c3": bodies["c3"], "c1": bodies["c1"]}),
+        _rec("c4", {"c4": "争议提交仲裁"}),  # 陈旧记录：目标已删除，忽略不阻塞
+    ]
+    r = _review_export({"order_ids": order, "clauses": fixed}, reviews)
+    assert r.status_code == 200, r.text
+    assert r.json()["text"].split("\n") == [
+        "1|甲方在七日内交付设备",
+        "2|乙方按 [[1]] 验收后付款",
+        "3|争议解决改为 [[1]]",
+    ]
+
+
+def test_review_endpoints_validate_draft_and_records():
+    doc = import_text(GOOD).json()
+    state = _state(doc)
+    bodies = _body_map(doc)
+    good = _rec("c1", {"c1": bodies["c1"]})
+    # 记录重复
+    assert _check(state, [good, dict(good)]).status_code == 422
+    # 记录身份形态非法
+    assert _check(state, [_rec("x1", {"c1": bodies["c1"]})]).status_code == 422
+    # 未记录自身正文 / 空记录
+    assert _check(state, [_rec("c1", {"c2": bodies["c2"]})]).status_code == 422
+    assert _check(state, [_rec("c1", {})]).status_code == 422
+    # 记录条款身份非法 / 记录正文形态损坏 / 空正文
+    assert _check(state, [_rec("c1", {"c1": bodies["c1"], "x2": "正文"})]).status_code == 422
+    assert _check(state, [_rec("c1", {"c1": "引用 [[1]]"})]).status_code == 422
+    assert _check(state, [_rec("c1", {"c1": "  "})]).status_code == 422
+    # export 同样校验
+    assert _review_export(state, [good, dict(good)]).status_code == 422
+    # 草稿损坏仍 422
+    r = client.post(
+        "/api/review/check",
+        json={"order_ids": ["c1"], "clauses": state["clauses"], "reviews": []},
+    )
+    assert r.status_code == 422
+    # 接口只读：草稿与记录不被改动
+    import copy
+
+    payload = {**state, "reviews": [good]}
+    snapshot = copy.deepcopy(payload)
+    assert _check(state, [good]).status_code == 200
+    assert payload == snapshot

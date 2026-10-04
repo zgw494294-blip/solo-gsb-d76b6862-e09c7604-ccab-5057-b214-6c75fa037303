@@ -412,6 +412,28 @@ button.danger:hover:not(:disabled) { background: var(--danger-bg); }
 .excerpt-actions { display: flex; gap: 10px; }
 
 /* --------------------------------------------------------------------------- */
+/* 逐条复核（未复核项列表 + 复核稿下载） */
+/* --------------------------------------------------------------------------- */
+.review-panel { border-color: #b7e4c7; background: #fbfefc; }
+.review-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.review-head h2 { margin-bottom: 4px; }
+.review-status { font-size: 12.5px; color: var(--muted); }
+
+.review-tag {
+  background: var(--ok-bg);
+  color: var(--ok);
+  border-radius: 4px;
+  font-size: 11.5px;
+  padding: 1px 7px;
+}
+
+.review-done { color: var(--ok); font-weight: 600; margin: 4px 0 10px; }
+.review-pending-head { font-size: 13px; margin: 4px 0 6px; }
+.review-list { list-style: none; margin: 0 0 10px; padding: 0; }
+.review-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 3px 0; font-size: 13px; }
+.review-actions { display: flex; gap: 10px; }
+
+/* --------------------------------------------------------------------------- */
 /* 校稿存档（工具栏状态 + 冲突 / 失败 / 提示横幅） */
 /* --------------------------------------------------------------------------- */
 .archive-status { white-space: nowrap; }

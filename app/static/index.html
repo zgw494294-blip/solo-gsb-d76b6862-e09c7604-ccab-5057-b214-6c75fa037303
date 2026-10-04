@@ -92,6 +92,27 @@
         <div id="excerpt-body"></div>
       </section>
 
+      <!-- 逐条复核：记录仅存本页内存；全部现存条款已复核且无失效引用时可下载复核稿 -->
+      <section id="review-panel" class="panel review-panel">
+        <div class="review-head">
+          <h2>逐条复核</h2>
+          <div class="review-status" id="review-status"></div>
+        </div>
+        <p class="hint">
+          点条款卡片上的「复核」，记录该条<b>已保存正文</b>及其直接、间接引用的全部现存条款当时的内部正文
+          （自引用、循环与重复引用只计一次）。此后每次改稿成功，若记录中的正文或目标存续有变化，
+          该条复核即被清除——纯重排、编号平移与无关改动保留复核；清除后改回旧文也不自动恢复；
+          新条款默认未复核；取消或操作失败不影响记录。复核记录仅存本页内存：
+          重新导入、恢复存档或刷新页面后清空（不进入存档）。
+          <b>全部现存条款已复核且无失效引用</b>时才能下载复核稿（格式与整稿导出一致）；
+          未保存编辑、拆分选择、写稿提交未结束或预览未同步时不能复核或下载。
+        </p>
+        <div id="review-body"></div>
+        <div class="review-actions">
+          <button id="review-download-btn" class="primary" disabled>下载复核稿</button>
+        </div>
+      </section>
+
       <div class="columns">
         <div class="panel">
           <h2>条款列表</h2>
